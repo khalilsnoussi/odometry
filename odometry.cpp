@@ -12,6 +12,35 @@ namespace fs = std::filesystem;
 
 
 
+
+//focal
+float fx = 718.8560;
+float fy = 718.8560;
+//principal point
+float cx = 607.1928;
+float cy = 185.2157;
+// stereo baseline times fx
+float bf = -386.1448;
+
+
+
+cv::Mat projMatrixLeft = (cv::Mat_<float>(3, 4) << fx, 0., cx, 0., 0., fy, cy, 0., 0,  0., 1., 0.);
+cv::Mat projMatrixRight = (cv::Mat_<float>(3, 4) << fx, 0., cx, bf, 0., fy, cy, 0., 0,  0., 1., 0.);
+
+
+// -----------------------------------------
+// Initialize variables
+// -----------------------------------------
+cv::Mat rotation = cv::Mat::eye(3, 3, CV_64F);
+cv::Mat translation = cv::Mat::zeros(3, 1, CV_64F);
+
+cv::Mat pose = cv::Mat::zeros(3, 1, CV_64F);
+cv::Mat Rpose = cv::Mat::eye(3, 3, CV_64F);
+    
+cv::Mat framePose = cv::Mat::eye(4, 4, CV_64F);
+cv::Mat trajectory = cv::Mat::zeros(600, 1200, CV_8UC3);
+
+
 struct FeatureSet 
 {
     std::vector<cv::Point2f> points;
@@ -306,9 +335,6 @@ std::vector<cv::Point2f> &leftPoints_t0, std::vector<cv::Point2f> &rightPoints_t
     currentFeatures.points = leftPoints_t1;
 }
 
-
-
-
 void display_tracking(cv::Mat &leftImage_t1, 
                      std::vector<cv::Point2f> &leftPoints_t0,
                      std::vector<cv::Point2f> &leftPoints_t1)
@@ -346,29 +372,152 @@ void display_tracking(cv::Mat &leftImage_t1,
 }
 
 
-
-void bundle_adjustment()
+void track_frame_to_frame(cv::Mat &projMatrixLeft, cv::Mat &projMatrixRight, std::vector<cv::Point2f> &leftPoints_t0, 
+                          std::vector<cv::Point2f> &leftPoints_t1, cv::Mat &points3d_t0, cv::Mat &rotation, cv::Mat &translation, bool mono_rotation)
 {
+    /*this function calculates frame to frame transformation*/
+
+    /*|-----------------------------------------------------------|
+      |Rotation(R) estimation using Nister's Five Points Algorithm|
+      |-----------------------------------------------------------|*/
+    double focal = projMatrixLeft.at<float>(0,0);
+    cv::Point2d principlePoint(projMatrixLeft.at<float>(0,2), projMatrixLeft.at<float>(1,2));
+
+    //recover the pose and the essential matrix
+    cv::Mat E, mask;
+    cv::Mat translation_mono = cv::Mat::zeros(3, 1, CV_64F);
+    if(mono_rotation)
+    {
+        E = cv::findEssentialMat(leftPoints_t0, leftPoints_t1, focal, principlePoint, cv::RANSAC, 0.999, 1.0, mask);
+        cv::recoverPose(E, leftPoints_t0, leftPoints_t1, rotation, translation_mono, focal, principlePoint, mask);
+    }
+      // ------------------------------------------------
+      // Translation (t) estimation by use solvePnPRansac
+      // ------------------------------------------------
+    cv::Mat distCoeffs = cv::Mat::zeros(4, 1, CV_64FC1);
+    cv::Mat rvec = cv::Mat::zeros(3, 1, CV_64FC1);
+    cv::Mat intrinsicMatrix = (cv::Mat_<float>(3,3)<< projMatrixLeft.at<float>(0, 0), projMatrixLeft.at<float>(0, 1), projMatrixLeft.at<float>(0, 2),
+                                                   projMatrixLeft.at<float>(1, 0), projMatrixLeft.at<float>(1, 1), projMatrixLeft.at<float>(1, 2),
+                                                   projMatrixLeft.at<float>(2, 0), projMatrixLeft.at<float>(2, 1), projMatrixLeft.at<float>(2, 2));
+    
+    int iterationsCount = 500;        // number of Ransac iterations.
+    float reprojectionError = .5;    // maximum allowed distance to consider it an inlier.
+    float confidence = 0.999;          // RANSAC successful confidence.
+    bool useExtrinsicGuess = true;
+    int flags =cv::SOLVEPNP_ITERATIVE;
+
+    cv::Mat inliers;
+    cv::solvePnPRansac(points3d_t0, leftPoints_t1, intrinsicMatrix, distCoeffs, rvec, translation,
+                          useExtrinsicGuess, iterationsCount, reprojectionError, confidence,
+                          inliers, flags );
+    
+    if (!mono_rotation)
+    {
+        cv::Rodrigues(rvec, rotation);
+    }
 
 
 }
 
 
+bool isRotationMatrix(cv::Mat &R)
+{
+    cv::Mat Rt;
+    transpose(R, Rt);
+    cv::Mat shouldBeIdentity = Rt * R;
+    cv::Mat I = cv::Mat::eye(3,3, shouldBeIdentity.type());
+     
+    return  norm(I, shouldBeIdentity) < 1e-6;
+     
+}
 
 
+cv::Vec3f rotationMatrixToEulerAngles(cv::Mat &R)
+{
+ 
+    assert(isRotationMatrix(R));
+     
+    float sy = sqrt(R.at<double>(0,0) * R.at<double>(0,0) +  R.at<double>(1,0) * R.at<double>(1,0) );
+ 
+    bool singular = sy < 1e-6; // If
+ 
+    float x, y, z;
+    if (!singular)
+    {
+        x = atan2(R.at<double>(2,1) , R.at<double>(2,2));
+        y = atan2(-R.at<double>(2,0), sy);
+        z = atan2(R.at<double>(1,0), R.at<double>(0,0));
+    }
+    else
+    {
+        x = atan2(-R.at<double>(1,2), R.at<double>(1,1));
+        y = atan2(-R.at<double>(2,0), sy);
+        z = 0;
+    }
+    return cv::Vec3f(x, y, z);
+     
+}
+
+void display(int frame_id, cv::Mat &trajectory, cv::Mat &pose)
+{
+    // draw estimated trajectory 
+    int x = int(pose.at<double>(0)) + 300;
+    int y = int(pose.at<double>(2)) + 100;
+    //std::cout << x << std::endl;
+    //std::cout << y << std::endl;
+    circle(trajectory, cv::Point(x, y) ,1, CV_RGB(255,0,0), 2);
+
+    cv::imshow( "Trajectory", trajectory );
+    cv::waitKey(1);
+}
+
+void integrateOdometryStereo(int frame_i, cv::Mat &rigid_body_transformation, cv::Mat &frame_pose, const cv::Mat &rotation, const cv::Mat &translation_stereo)
+{
+
+    // std::cout << "rotation" << rotation << std::endl;
+    // std::cout << "translation_stereo" << translation_stereo << std::endl;
+
+    
+    cv::Mat addup = (cv::Mat_<double>(1, 4) << 0, 0, 0, 1);
+
+    cv::hconcat(rotation, translation_stereo, rigid_body_transformation);
+    cv::vconcat(rigid_body_transformation, addup, rigid_body_transformation);
+
+    // std::cout << "rigid_body_transformation" << rigid_body_transformation << std::endl;
+
+    double scale = sqrt((translation_stereo.at<double>(0))*(translation_stereo.at<double>(0)) 
+                        + (translation_stereo.at<double>(1))*(translation_stereo.at<double>(1))
+                        + (translation_stereo.at<double>(2))*(translation_stereo.at<double>(2))) ;
+
+    // frame_pose = frame_pose * rigid_body_transformation;
+    //std::cout << "scale: " << scale << std::endl;
+
+    rigid_body_transformation = rigid_body_transformation.inv();
+    // if ((scale>0.1)&&(translation_stereo.at<double>(2) > translation_stereo.at<double>(0)) && (translation_stereo.at<double>(2) > translation_stereo.at<double>(1))) 
+    if (scale > 0.05 && scale < 10) 
+    {
+      // std::cout << "Rpose" << Rpose << std::endl;
+
+      frame_pose = frame_pose * rigid_body_transformation;
+
+    }
+    else 
+    {
+     std::cout << "[WARNING] scale below 0.1, or incorrect translation" << std::endl;
+    }
+}
+
+void bundle_adjustment()
+{ /*to do later using Ceres*/
 
 
-
-
+}
 
 /* function that loads images from a given path*/
 void load_image(int &frameId, std::vector<std::string> &imageNames, cv::Mat &img)
 {
     img = cv::imread(imageNames[frameId], cv::IMREAD_GRAYSCALE);
 }
-
-
-
 
 
 void read_images_paths(std::string &path, 
@@ -415,10 +564,6 @@ int main()
    cv::Mat leftImage_t0, rightImage_t0;
    cv::Mat leftImage_t1, rightImage_t1;
 
-
-
-
-
    FeatureSet currentFeatures;
    int frameId = 0;
 
@@ -433,7 +578,7 @@ int main()
 
    for (int i = frameId + 1; frameId < rightImageNames.size(); frameId++)
    {
-        std::cout << "frame number: " << frameId+1<< std::endl;
+        //std::cout << "frame number: " << frameId+1<< std::endl;
         //loading right image
         load_image(frameId, rightImageNames, rightImage_t1);
 
@@ -453,7 +598,39 @@ int main()
         //std::cout << "inside of main : leftPoints_t0.size(): " << leftPoints_t0.size() << std::endl;
 
 
-        display_tracking(leftImage_t1, leftPoints_t0, leftPoints_t1);
+        // ---------------------
+        // Triangulate 3D Points
+        // ---------------------
 
-   }
+        cv::Mat points3d_t0, points4d_t0;
+        cv::triangulatePoints(projMatrixLeft, projMatrixRight, leftPoints_t0, rightPoints_t0, points4d_t0);
+        cv::convertPointsFromHomogeneous(points4d_t0.t(), points3d_t0);
+
+        //Tracking transformation
+
+        track_frame_to_frame(projMatrixLeft, projMatrixRight, leftPoints_t0, leftPoints_t1, points3d_t0, rotation, translation, false);
+        //std::cout << "rotation : " << rotation << std::endl;
+        //display_tracking(leftImage_t1, leftPoints_t0, leftPoints_t1);
+
+        cv::Vec3f eulerRotation = rotationMatrixToEulerAngles(rotation);
+
+        cv::Mat rigidBodyTransformation;
+
+        if(abs(eulerRotation[1])<0.1 && abs(eulerRotation[0])<0.1 && abs(eulerRotation[2])<0.1)
+        {
+            integrateOdometryStereo(frameId, rigidBodyTransformation, framePose, rotation, translation);
+
+        } else {
+
+            std::cout << "Too large rotation"  << std::endl;
+        }
+
+        cv::Mat xyz = framePose.col(3).clone();
+        std::cout << "frame pose: " << xyz << std::endl;
+        display(frameId, trajectory, xyz);
+        
+
+    }
+
+    return 0;
 }
